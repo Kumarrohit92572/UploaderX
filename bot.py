@@ -15,6 +15,7 @@ from downloader import Downloader
 import logging
 from pyrogram.enums import ParseMode
 import traceback
+import threading
 
 # Initialize bot
 app = Client("url_uploader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -36,6 +37,8 @@ logger.addHandler(handler)
 
 # User states
 USER_STATES = {}
+# Lock for updating progress messages
+update_locks = {}
 
 
 def format_size(size_bytes):
@@ -84,6 +87,22 @@ def is_video_file(file_path):
     ]
     ext = os.path.splitext(file_path)[1].lower()
     return ext in video_extensions
+
+
+# Helper function to format ETA
+def format_eta(seconds):
+    if seconds is None or seconds <= 0:
+        return "Almost done..."
+    
+    minutes, seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    
+    if hours > 0:
+        return f"{hours}h {minutes}m {seconds}s"
+    elif minutes > 0:
+        return f"{minutes}m {seconds}s"
+    else:
+        return f"{seconds}s"
 
 
 @app.on_message(filters.command("start"))
@@ -245,11 +264,15 @@ async def handle_messages(client: Client, message: Message):
 
         # Set canceled flag to False for new download
         USER_STATES[user_id]["canceled"] = False
+        
+        # Create lock for this user if it doesn't exist
+        if user_id not in update_locks:
+            update_locks[user_id] = threading.Lock()
 
         # Initial status message
         status_message = await message.reply_text(
             f"{'🔐 Dᴇᴄʀʏᴘᴛɪɴɢ & ' if is_encrypted else ''}Dᴏᴡɴʟᴏᴀᴅ Sᴛᴀʀᴛᴇᴅ....\n\n"
-            "⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜\n\n"
+            f"{create_progress_bar(0)}\n\n"
             "╭━━━━❰ᴘʀᴏɢʀᴇss ʙᴀʀ❱━➣\n"
             "┣⪼ 🗃️ Sɪᴢᴇ: Waiting... \n"
             "┣⪼ ⏳️ Dᴏɴᴇ : 0%\n"
@@ -265,22 +288,7 @@ async def handle_messages(client: Client, message: Message):
         USER_STATES[user_id]["current_task"]["status_message"] = status_message
         USER_STATES[user_id]["current_task"]["message_id"] = status_message.id
         USER_STATES[user_id]["current_task"]["chat_id"] = status_message.chat.id
-
-        # Helper function to format ETA
-        def format_eta(seconds):
-            if seconds is None or seconds <= 0:
-                return "Almost done..."
-
-            minutes, seconds = divmod(int(seconds), 60)
-            hours, minutes = divmod(minutes, 60)
-
-            if hours > 0:
-                return f"{hours}h {minutes}m {seconds}s"
-            elif minutes > 0:
-                return f"{minutes}m {seconds}s"
-            else:
-                return f"{seconds}s"
-
+        
         # Progress callback - updates the status message
         async def progress_callback(
             progress, speed, total_size, downloaded_size, eta, filename=""
@@ -300,38 +308,48 @@ async def handle_messages(client: Client, message: Message):
                 if not current_message:
                     logger.warning(f"No status message found for user {user_id}")
                     return
-
-                # Create progress text
-                progress_bar = create_progress_bar(progress)
-                status_text = (
-                    f"{'🔐 Dᴇᴄʀʏᴘᴛɪɴɢ & ' if is_encrypted else ''}Dᴏᴡɴʟᴏᴀᴅɪɴɢ....\n\n"
-                    f"{progress_bar}\n\n"
-                    "╭━━━━❰ᴘʀᴏɢʀᴇss ʙᴀʀ❱━➣\n"
-                    f"┣⪼ 🗃️ Sɪᴢᴇ: {format_size(downloaded_size)} / {format_size(total_size)}\n"
-                    f"┣⪼ ⏳️ Dᴏɴᴇ : {progress:.1f}%\n"
-                    f"┣⪼ 🚀 Sᴩᴇᴇᴅ: {format_size(speed)}/s\n"
-                    f"┣⪼ ⏰️ Eᴛᴀ: {format_eta(eta)}\n"
-                    "╰━━━━━━━━━━━━━━━➣"
-                )
-
-                # Update the message with new progress
-                try:
-                    await current_message.edit_text(
-                        status_text,
-                        reply_markup=InlineKeyboardMarkup(
-                            [
-                                [
-                                    InlineKeyboardButton(
-                                        "❌ Cancel", callback_data="cancel_download"
-                                    )
-                                ]
-                            ]
-                        ),
+                
+                # Use lock to prevent multiple concurrent updates
+                with update_locks[user_id]:
+                    # Only update if enough time has passed since last update (rate limiting)
+                    now = time.time()
+                    last_update = current_task.get("last_update_time", 0)
+                    if now - last_update < 0.5:  # 0.5 seconds minimum between updates
+                        return
+                
+                    # Create progress text
+                    progress_bar = create_progress_bar(progress)
+                    status_text = (
+                        f"{'🔐 Dᴇᴄʀʏᴘᴛɪɴɢ & ' if is_encrypted else ''}Dᴏᴡɴʟᴏᴀᴅɪɴɢ....\n\n"
+                        f"{progress_bar}\n\n"
+                        "╭━━━━❰ᴘʀᴏɢʀᴇss ʙᴀʀ❱━➣\n"
+                        f"┣⪼ 🗃️ Sɪᴢᴇ: {format_size(downloaded_size)} / {format_size(total_size)}\n"
+                        f"┣⪼ ⏳️ Dᴏɴᴇ : {progress:.1f}%\n"
+                        f"┣⪼ 🚀 Sᴩᴇᴇᴅ: {format_size(speed)}/s\n"
+                        f"┣⪼ ⏰️ Eᴛᴀ: {format_eta(eta)}\n"
+                        "╰━━━━━━━━━━━━━━━➣"
                     )
-                    # Log successful update
-                    logger.info(f"Updated progress for user {user_id}: {progress:.1f}%")
-                except Exception as e:
-                    logger.error(f"Failed to update progress message: {e}")
+    
+                    # Update the message with new progress
+                    try:
+                        await current_message.edit_text(
+                            status_text,
+                            reply_markup=InlineKeyboardMarkup(
+                                [
+                                    [
+                                        InlineKeyboardButton(
+                                            "❌ Cancel", callback_data="cancel_download"
+                                        )
+                                    ]
+                                ]
+                            ),
+                        )
+                        # Log successful update
+                        logger.info(f"Updated progress for user {user_id}: {progress:.1f}%")
+                        # Store the last update time
+                        current_task["last_update_time"] = now
+                    except Exception as e:
+                        logger.error(f"Failed to update progress message: {e}")
 
             except Exception as e:
                 # Log the full exception with traceback
@@ -395,7 +413,7 @@ async def handle_messages(client: Client, message: Message):
 
             # Last upload update time
             last_upload_update_time = time.time()
-            update_interval = 2  # seconds between updates
+            update_interval = 1  # seconds between updates
 
             # Progress callback for upload with rate limiting
             async def upload_progress(current, total):
@@ -473,6 +491,7 @@ async def handle_messages(client: Client, message: Message):
                     await message.reply_video(
                         result,
                         caption=caption,
+                        parse_mode=ParseMode.MARKDOWN,
                         supports_streaming=True,
                         width=width,
                         height=height,
@@ -488,6 +507,7 @@ async def handle_messages(client: Client, message: Message):
                     await message.reply_document(
                         result,
                         caption=caption,
+                        parse_mode=ParseMode.MARKDOWN,
                         thumb=thumbnail_path,
                         progress=upload_progress,
                     )
@@ -499,6 +519,7 @@ async def handle_messages(client: Client, message: Message):
                 await message.reply_document(
                     result,
                     caption=caption,
+                    parse_mode=ParseMode.MARKDOWN,
                     thumb=thumbnail_path,
                     progress=upload_progress,
                 )
