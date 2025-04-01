@@ -115,7 +115,7 @@ async def start_command(client: Client, message: Message):
                 [
                     [
                         InlineKeyboardButton(
-                            "📞 Contact Admin", url="https://t.me/your_admin_username"
+                            "📞 Contact Admin", url="https://t.me/Strangerboy27_bot_strangerboy"
                         )
                     ]
                 ]
