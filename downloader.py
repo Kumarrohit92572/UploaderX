@@ -12,29 +12,37 @@ import sys
 import subprocess
 import shutil
 from pathlib import Path
+import json
+import traceback
+from concurrent.futures import ThreadPoolExecutor
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
+from typing import Callable, Optional, Tuple, Dict, Any
 
 # Configure modern terminal logging with cleaner format
 class ColoredFormatter(logging.Formatter):
     """Custom formatter with colors"""
-    grey = "\x1b[38;21m"
-    blue = "\x1b[38;5;39m"
-    yellow = "\x1b[38;5;226m"
-    red = "\x1b[38;5;196m"
-    green = "\x1b[38;5;40m"
+    grey = "\x1b[38;20m"
+    yellow = "\x1b[33;20m"
+    green = "\x1b[32;20m"
+    blue = "\x1b[34;20m"
+    red = "\x1b[31;20m"
     bold_red = "\x1b[31;1m"
     reset = "\x1b[0m"
-
+    
+    format_str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    
     FORMATS = {
-        logging.DEBUG: grey + "%(asctime)s [DEBUG] %(message)s" + reset,
-        logging.INFO: blue + "%(asctime)s [INFO] %(message)s" + reset,
-        logging.WARNING: yellow + "%(asctime)s [WARNING] %(message)s" + reset,
-        logging.ERROR: red + "%(asctime)s [ERROR] %(message)s" + reset,
-        logging.CRITICAL: bold_red + "%(asctime)s [CRITICAL] %(message)s" + reset
+        logging.DEBUG: grey + format_str + reset,
+        logging.INFO: green + format_str + reset,
+        logging.WARNING: yellow + format_str + reset,
+        logging.ERROR: red + format_str + reset,
+        logging.CRITICAL: bold_red + format_str + reset
     }
-
+    
     def format(self, record):
         log_fmt = self.FORMATS.get(record.levelno)
-        formatter = logging.Formatter(log_fmt, datefmt='%H:%M:%S')
+        formatter = logging.Formatter(log_fmt, datefmt="%Y-%m-%d %H:%M:%S")
         return formatter.format(record)
 
 # Setup logger with clean output
@@ -46,6 +54,9 @@ logger.handlers = []  # Clear any existing handlers
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(ColoredFormatter())
 logger.addHandler(console_handler)
+
+# Disable noisy logs from urllib3
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 def format_bytes(bytes_val):
     """Format bytes to human readable string"""
@@ -84,52 +95,68 @@ class VideoInfo:
         self.height = 0
         self.duration = 0
         self.thumbnail = None
-        self.title = ""
-        self.format = ""
+        self.title = None
+        self.format = None
+
+# Global event loop for callbacks
+loop = asyncio.get_event_loop()
 
 class Downloader:
-    def __init__(self, url: str, filename: str, progress_callback=None):
+    def __init__(
+        self,
+        url: str,
+        filename: str,
+        progress_callback: Optional[Callable] = None,
+        download_path: str = "downloads",
+    ):
         self.url = url
         self.filename = filename
         self.progress_callback = progress_callback
-        self.downloaded_path = None
-        self.file_size = 0
-        self.start_time = time.time()
-        self.last_downloaded = 0
-        self.last_time = time.time()
-        self.speed = 0
-        self.eta = 0
-        self.decryption_key = None
-        self.last_update_time = 0
-        self.update_interval = 1  # Update UI every 1 second to keep it responsive
-        self.video_info = VideoInfo()
+        self.download_path = download_path
         self.download_started = False
+        self.download_canceled = False
+        self.is_encrypted = False
+        self.encryption_key = None
+        self.video_info = VideoInfo()
+        self.event_loop = loop
+        self.update_interval = 0.3  # seconds between progress updates
+        self.last_update_time = 0
+        self.executor = ThreadPoolExecutor(max_workers=2)  # For running background tasks
         
-        # Check if URL contains decryption key
-        if '*' in url:
-            self.url, self.decryption_key = url.split('*', 1)
-            logger.info(f"🔐 Detected encrypted video URL with key: {self.decryption_key[:3]}***")
+        # Create download directory if it doesn't exist
+        os.makedirs(download_path, exist_ok=True)
+        
+        # Check if URL contains encryption key
+        if "*" in url:
+            url_parts = url.split("*", 1)
+            if len(url_parts) == 2:
+                self.url = url_parts[0]
+                self.encryption_key = url_parts[1]
+                self.is_encrypted = True
+                logger.info(f"Detected encrypted video with key: {self.encryption_key}")
 
     def decrypt_vid_data(self, vid_data, key):
-        """Decrypt video data using XOR with key"""
-        data_length = len(vid_data)
-        key_length = len(key)
-        max_length = min(data_length, 28)
-        for index in range(max_length):
-            current_byte = vid_data[index]
-            if index < key_length:
-                decrypted_byte = current_byte ^ ord(key[index])
-            else:
-                decrypted_byte = current_byte ^ index
-            vid_data[index] = decrypted_byte
-        return vid_data
+        """Decrypt video data using the provided key"""
+        try:
+            key = key.encode('utf-8')
+            # Use first 16 bytes as key and iv
+            key_16 = key[:16].ljust(16, b'\0')
+            iv = key[:16].ljust(16, b'\0')
+            
+            cipher = AES.new(key_16, AES.MODE_CBC, iv)
+            decrypted_data = unpad(cipher.decrypt(vid_data), AES.block_size)
+            
+            return decrypted_data
+        except Exception as e:
+            logger.error(f"Decryption error: {e}")
+            raise e
 
     def get_file_extension(self):
         parsed_url = urlparse(self.url)
         path = parsed_url.path.lower()
         
         # Handle encrypted video URLs
-        if self.decryption_key:
+        if self.encryption_key:
             # Extract original extension from URL
             ext_match = re.search(r'\.(mkv|mp4|avi|mov|wmv|flv|webm)(?:\*|$)', self.url.lower())
             if ext_match:
@@ -144,354 +171,328 @@ class Downloader:
         return '.mkv'  # Default to .mkv
 
     async def send_initial_progress(self):
-        """Send initial progress update to ensure UI is responsive"""
+        """Send initial progress update to initialize UI"""
         if self.progress_callback:
             try:
-                # Send initial progress with dummy values
                 await self.progress_callback(0, 0, 0, 0, 0, self.filename)
+                logger.info("Sent initial progress update")
             except Exception as e:
-                logger.error(f"Error sending initial progress: {e}")
+                logger.error(f"Error sending initial progress update: {e}")
+                logger.error(traceback.format_exc())
 
-    def progress_hook(self, d):
-        """Progress hook for yt-dlp that follows exact yt-dlp output format"""
+    def progress_hook(self, d: Dict[str, Any]) -> None:
+        """Progress hook for yt-dlp"""
+        if self.download_canceled:
+            raise Exception("Download was canceled")
+        
         try:
-            # First progress update - mark download as started
-            if not self.download_started:
-                self.download_started = True
-                logger.info(f"🚀 Starting download: {self.filename}")
-                # Force an immediate update for better UX
-                self.last_update_time = 0
+            status = d.get("status")
             
-            if d['status'] == 'downloading':
-                # Get progress data directly from yt-dlp
-                downloaded = d.get('downloaded_bytes', 0)
-                total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
-                speed = d.get('speed', 0)
-                eta = d.get('eta', 0)
-                filename = d.get('filename', '')
+            if status == "downloading":
+                # Extract information from the progress data
+                downloaded_bytes = d.get("downloaded_bytes", 0)
+                total_bytes = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
+                speed = d.get("speed", 0)
+                elapsed = d.get("elapsed", 0)
+                filename = d.get("filename", "")
+                
+                # Set download started flag if this is the first progress update
+                if not self.download_started:
+                    self.download_started = True
+                    logger.info("Download started")
                 
                 # Calculate progress percentage
-                if total:
-                    progress = (downloaded / total) * 100
+                if total_bytes > 0:
+                    progress = (downloaded_bytes / total_bytes) * 100
                 else:
                     progress = 0
-                    
-                # Store video info if available
-                if 'info_dict' in d:
-                    info_dict = d.get('info_dict', {})
-                    self.video_info.width = info_dict.get('width', 0)
-                    self.video_info.height = info_dict.get('height', 0)
-                    self.video_info.duration = info_dict.get('duration', 0)
-                    self.video_info.title = info_dict.get('title', '')
-                    self.video_info.format = info_dict.get('format', '')
-                    
-                # Format status message exactly like yt-dlp
-                status = f"[download] {progress:5.1f}% of {format_bytes(total)} at {format_bytes(speed)}/s ETA {format_time(eta)}"
-                logger.info(status)
                 
-                # Throttle UI updates to avoid Telegram rate limiting
+                # Calculate ETA
+                eta = d.get("eta", None)
+                
+                # Limit update frequency to avoid overwhelming the UI
                 current_time = time.time()
                 if (current_time - self.last_update_time) >= self.update_interval:
                     self.last_update_time = current_time
                     
-                    # Call the progress callback if it exists
+                    # Format the output like yt-dlp
+                    logger.info(
+                        f"[download] {progress:.1f}% of {total_bytes/1024/1024:.1f}MB "
+                        f"at {speed/1024/1024:.1f}MB/s ETA {eta:.1f}s"
+                    )
+                    
+                    # Call the progress callback if provided
                     if self.progress_callback:
                         try:
-                            loop = asyncio.get_event_loop()
-                            if loop.is_running():
-                                loop.create_task(self.progress_callback(progress, speed, total, downloaded, eta, filename))
-                            else:
-                                loop.run_until_complete(self.progress_callback(progress, speed, total, downloaded, eta, filename))
-                        except Exception as e:
-                            logger.error(f"Progress callback error: {e}")
+                            # Use asyncio.run_coroutine_threadsafe to ensure the callback
+                            # is executed in the correct event loop context
+                            coro = self.progress_callback(
+                                progress, speed, total_bytes, downloaded_bytes, eta, filename
+                            )
                             
-                    # Update tracking variables
-                    self.last_downloaded = downloaded
-                    self.last_time = current_time
+                            # Schedule the coroutine to run in the event loop
+                            if self.event_loop and self.event_loop.is_running():
+                                # If event loop is running, use run_coroutine_threadsafe
+                                asyncio.run_coroutine_threadsafe(coro, self.event_loop)
+                            else:
+                                # If event loop is not running, create a new one
+                                asyncio.run(coro)
+                        except Exception as e:
+                            logger.error(f"Error in progress callback: {e}")
+                            logger.error(traceback.format_exc())
             
-            elif d['status'] == 'finished':
-                logger.info(f"✅ Download finished: {d.get('filename', 'unknown')}")
+            elif status == "finished":
+                logger.info(f"Download finished: {d.get('filename', '')}")
                 
-                # Store video info if available
-                if 'info_dict' in d:
-                    info_dict = d.get('info_dict', {})
-                    self.video_info.width = info_dict.get('width', 0)
-                    self.video_info.height = info_dict.get('height', 0)
-                    self.video_info.duration = info_dict.get('duration', 0)
-                    self.video_info.title = info_dict.get('title', '')
-                    self.video_info.format = info_dict.get('format', '')
+                # Update video info from the info_dict if available
+                if "info_dict" in d:
+                    info = d["info_dict"]
+                    self.video_info.title = info.get("title", "")
+                    self.video_info.format = info.get("format", "")
                     
-                # Final progress update
-                if self.progress_callback:
-                    try:
-                        loop = asyncio.get_event_loop()
-                        filename = d.get('filename', '')
-                        if loop.is_running():
-                            loop.create_task(self.progress_callback(100, 0, self.last_downloaded, self.last_downloaded, 0, filename))
-                        else:
-                            loop.run_until_complete(self.progress_callback(100, 0, self.last_downloaded, self.last_downloaded, 0, filename))
-                    except Exception as e:
-                        logger.error(f"Progress callback error: {e}")
+                    # Try to get thumbnail from info dict
+                    if "thumbnail" in info and info["thumbnail"]:
+                        thumbnail_url = info["thumbnail"]
+                        try:
+                            # Download thumbnail
+                            thumbnail_path = os.path.join(
+                                self.download_path, 
+                                f"{os.path.basename(d.get('filename', 'video'))}_thumb.jpg"
+                            )
+                            
+                            # Use yt-dlp to download thumbnail
+                            ydl_opts = {
+                                "quiet": True,
+                                "no_warnings": True,
+                                "outtmpl": thumbnail_path,
+                            }
+                            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                ydl.download([thumbnail_url])
+                            
+                            if os.path.exists(thumbnail_path):
+                                self.video_info.thumbnail = thumbnail_path
+                                logger.info(f"Downloaded thumbnail from URL: {thumbnail_path}")
+                        except Exception as e:
+                            logger.error(f"Error downloading thumbnail: {e}")
+        
         except Exception as e:
-            logger.error(f"Error in progress_hook: {e}")
+            logger.error(f"Error in progress hook: {e}")
+            logger.error(traceback.format_exc())
 
     def extract_video_metadata(self, video_path):
-        """Extract video metadata including dimensions and duration"""
+        """Extract video metadata using ffprobe"""
         try:
-            # First try yt-dlp method to extract metadata
+            # Extract video metadata using ffprobe
+            cmd = [
+                "ffprobe",
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height,duration",
+                "-of", "json",
+                video_path
+            ]
+            
+            # Run ffprobe
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                # Parse the output
+                try:
+                    data = json.loads(result.stdout)
+                    if 'streams' in data and len(data['streams']) > 0:
+                        stream = data['streams'][0]
+                        self.video_info.width = int(stream.get('width', 0))
+                        self.video_info.height = int(stream.get('height', 0))
+                        self.video_info.duration = float(stream.get('duration', 0))
+                        logger.info(f"Extracted video metadata: {self.video_info.width}x{self.video_info.height}, {self.video_info.duration}s")
+                except json.JSONDecodeError:
+                    logger.warning("Could not parse ffprobe output as JSON")
+            
+            # Generate thumbnail
+            thumbnail_path = os.path.join(self.download_path, f"{Path(video_path).stem}_thumb.jpg")
+            cmd = [
+                "ffmpeg",
+                "-i", video_path,
+                "-ss", "00:00:05",  # 5 seconds in
+                "-vframes", "1",
+                "-vf", "scale=320:-1",  # 320px width, keep aspect ratio
+                "-y",  # Overwrite without asking
+                thumbnail_path
+            ]
+            
+            # Run ffmpeg
+            result = subprocess.run(cmd, capture_output=True)
+            
+            if result.returncode == 0 and os.path.exists(thumbnail_path):
+                self.video_info.thumbnail = thumbnail_path
+                logger.info(f"Generated thumbnail: {thumbnail_path}")
+            else:
+                logger.warning("Could not generate thumbnail")
+        
+        except Exception as e:
+            logger.error(f"Error extracting video metadata: {e}")
+            logger.error(traceback.format_exc())
+
+    async def download(self) -> Tuple[bool, str, VideoInfo]:
+        """Download the file with progress tracking"""
+        try:
+            # Send initial progress if callback exists
+            if self.progress_callback:
+                await self.send_initial_progress()
+            
+            output_path = os.path.join(self.download_path, self.filename)
+            logger.info(f"Starting download of {self.url} to {output_path}")
+            
+            final_path = None
+            
+            if self.is_encrypted:
+                # For encrypted videos, handle differently
+                logger.info(f"Processing encrypted video: {self.url}")
+                
+                # Download with yt-dlp in a separate thread to prevent blocking
+                download_success, temp_file = await self._download_with_ytdlp()
+                
+                if not download_success:
+                    logger.error(f"Failed to download encrypted video: {temp_file}")
+                    return False, f"Download failed: {temp_file}", self.video_info
+                
+                # Decrypt the file after downloading
+                logger.info(f"Downloaded encrypted file to {temp_file}, decrypting...")
+                try:
+                    # Ensure proper file extension
+                    output_path = self.ensure_proper_extension(output_path)
+                    
+                    # Read encrypted data
+                    with open(temp_file, "rb") as f:
+                        encrypted_data = f.read()
+                    
+                    # Decrypt the data
+                    decrypted_data = self.decrypt_vid_data(encrypted_data, self.encryption_key)
+                    
+                    # Write decrypted data
+                    with open(output_path, "wb") as f:
+                        f.write(decrypted_data)
+                    
+                    logger.info(f"Decryption successful, saved to {output_path}")
+                    final_path = output_path
+                    
+                    # Extract metadata from the decrypted file
+                    await self.extract_video_metadata(final_path)
+                    
+                    # Clean up temporary file
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+                except Exception as e:
+                    logger.error(f"Decryption error: {e}")
+                    logger.error(traceback.format_exc())
+                    return False, f"Decryption failed: {str(e)}", self.video_info
+            
+            else:
+                # For regular videos, use yt-dlp directly
+                download_success, temp_file = await self._download_with_ytdlp()
+                
+                if not download_success:
+                    logger.error(f"Download failed: {temp_file}")
+                    return False, f"Download failed: {temp_file}", self.video_info
+                
+                # Ensure proper file extension
+                output_path = self.ensure_proper_extension(output_path)
+                
+                # Rename if needed
+                if temp_file != output_path and os.path.exists(temp_file):
+                    # Make sure target directory exists
+                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                    # Move the file to final destination
+                    shutil.move(temp_file, output_path)
+                    logger.info(f"Moved downloaded file from {temp_file} to {output_path}")
+                
+                final_path = output_path
+                
+                # Extract metadata from the downloaded file
+                await self.extract_video_metadata(final_path)
+            
+            return True, final_path, self.video_info
+        
+        except Exception as e:
+            logger.error(f"Download error: {e}")
+            logger.error(traceback.format_exc())
+            return False, str(e), self.video_info
+
+    def ensure_proper_extension(self, filepath):
+        """Ensure the file has the correct extension based on the URL"""
+        url_path = self.url.split("?")[0]  # Remove query params
+        url_ext = os.path.splitext(url_path)[1].lower()
+        
+        # If URL has an extension and filepath doesn't match it
+        if url_ext and not filepath.lower().endswith(url_ext):
+            # Get the base filepath without extension
+            base_path = os.path.splitext(filepath)[0]
+            # Add the extension from URL
+            return f"{base_path}{url_ext}"
+        
+        return filepath
+
+    async def _download_with_ytdlp(self) -> Tuple[bool, str]:
+        """Run yt-dlp download in a separate thread to avoid blocking"""
+        logger.info(f"Starting yt-dlp download for {self.url}")
+        
+        try:
+            # Send initial progress update
+            if self.progress_callback and not self.download_started:
+                await self.send_initial_progress()
+            
+            # Set up yt-dlp options
+            outtmpl = os.path.join(self.download_path, "%(title).100s.%(ext)s")
+            
             ydl_opts = {
-                'skip_download': True,
-                'quiet': True,
-                'no_warnings': True,
+                "quiet": False,
+                "no_warnings": False,
+                "progress_hooks": [self.progress_hook],
+                "outtmpl": outtmpl,
+                "format": "best/bestvideo+bestaudio",
+                "writeinfojson": True,
+                "retries": 10,
+                "fragment_retries": 10,
+                "concurrent_fragment_downloads": 10,  # Download fragments concurrently for faster speed
+                "geo_bypass": True,
+                "no_check_certificate": True,
+                "ignoreerrors": False,
+                "nooverwrites": False,
+                "continuedl": True,
             }
             
-            if os.path.exists(video_path):
-                # Try to get video dimensions using ffprobe if available
+            # Function to run in the thread pool
+            def run_download():
                 try:
-                    cmd = [
-                        'ffprobe', '-v', 'error', '-select_streams', 'v:0',
-                        '-show_entries', 'stream=width,height,duration',
-                        '-of', 'csv=p=0', video_path
-                    ]
-                    result = subprocess.run(cmd, capture_output=True, text=True)
-                    if result.returncode == 0 and result.stdout.strip():
-                        dimensions = result.stdout.strip().split(',')
-                        if len(dimensions) >= 3:
-                            self.video_info.width = int(float(dimensions[0]))
-                            self.video_info.height = int(float(dimensions[1]))
-                            self.video_info.duration = int(float(dimensions[2]))
-                            logger.info(f"📊 Video metadata: {self.video_info.width}x{self.video_info.height}, {self.video_info.duration}s")
-                except Exception as e:
-                    logger.warning(f"Cannot extract video metadata with ffprobe: {e}")
-            
-            # Generate thumbnail if not already set
-            if not self.video_info.thumbnail:
-                thumbnail_path = f"{os.path.splitext(video_path)[0]}_thumb.jpg"
-                try:
-                    cmd = [
-                        'ffmpeg', '-y', '-i', video_path, '-ss', '00:00:05', '-vframes', '1',
-                        '-vf', 'scale=320:-1', thumbnail_path
-                    ]
-                    subprocess.run(cmd, capture_output=True)
-                    if os.path.exists(thumbnail_path) and os.path.getsize(thumbnail_path) > 0:
-                        self.video_info.thumbnail = thumbnail_path
-                        logger.info(f"🖼️ Thumbnail generated: {thumbnail_path}")
-                except Exception as e:
-                    logger.warning(f"Cannot generate thumbnail: {e}")
-                    
-            # Use default values if we couldn't extract metadata
-            if self.video_info.width == 0 or self.video_info.height == 0:
-                self.video_info.width = 1280  # Default to HD resolution
-                self.video_info.height = 720
-            
-            if self.video_info.duration == 0:
-                self.video_info.duration = 60  # Default duration
-                
-            return True
-        except Exception as e:
-            logger.error(f"Failed to extract video metadata: {e}")
-            return False
-
-    async def download(self):
-        """Download a file from URL with progress reporting"""
-        try:
-            # Send initial progress update immediately
-            await self.send_initial_progress()
-            
-            if not os.path.exists(DOWNLOAD_DIR):
-                os.makedirs(DOWNLOAD_DIR)
-                logger.info(f"📁 Created download directory: {DOWNLOAD_DIR}")
-
-            file_extension = self.get_file_extension()
-            output_path = os.path.join(DOWNLOAD_DIR, f"{self.filename}{file_extension}")
-            temp_path = os.path.join(DOWNLOAD_DIR, f"{self.filename}_temp{file_extension}")
-
-            # Clean any existing files
-            for path in [output_path, temp_path]:
-                if os.path.exists(path):
-                    os.remove(path)
-
-            # Special handling for encrypted videos
-            if self.decryption_key:
-                try:
-                    logger.info(f"🔐 Starting encrypted video download: {self.filename}")
-                    
-                    # Use yt-dlp for faster downloads with optimal settings
-                    ydl_opts = {
-                        'format': 'best/bestvideo+bestaudio',
-                        'outtmpl': temp_path,
-                        'progress_hooks': [self.progress_hook],
-                        'quiet': True,
-                        'noprogress': False,
-                        'no_warnings': True,
-                        'extract_flat': False,
-                        'nocheckcertificate': True,
-                        'ignoreerrors': True,
-                        'no_color': True,
-                        'prefer_insecure': True,
-                        'allow_unplayable_formats': True,
-                        'concurrent_fragments': 5,
-                        'buffersize': 32768,
-                        'http_chunk_size': 10485760,
-                        'retries': 10,
-                        'fragment_retries': 10,
-                        'file_access_retries': 10,
-                        'extractor_retries': 10,
-                        'socket_timeout': 30,
-                        'writeinfojson': True,  # Write info json for metadata
-                    }
-
-                    # Download first with yt-dlp
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        info_dict = ydl.extract_info(self.url, download=True)
-                        downloaded_filename = ydl.prepare_filename(info_dict)
+                        info = ydl.extract_info(self.url, download=True)
                         
-                        # Extract video metadata from info_dict
-                        if info_dict:
-                            self.video_info.width = info_dict.get('width', 0)
-                            self.video_info.height = info_dict.get('height', 0)
-                            self.video_info.duration = info_dict.get('duration', 0) 
-                            self.video_info.title = info_dict.get('title', self.filename)
-                            self.video_info.format = info_dict.get('format', '')
+                        # Get the actual filename that was downloaded
+                        if info:
+                            filename = ydl.prepare_filename(info)
                             
-                            # Extract thumbnail if available
-                            thumbnail_url = info_dict.get('thumbnail')
-                            if thumbnail_url:
-                                thumbnail_path = f"{os.path.splitext(temp_path)[0]}_thumb.jpg"
-                                try:
-                                    # Download thumbnail
-                                    r = requests.get(thumbnail_url, stream=True)
-                                    if r.status_code == 200:
-                                        with open(thumbnail_path, 'wb') as f:
-                                            r.raw.decode_content = True
-                                            shutil.copyfileobj(r.raw, f)
-                                        if os.path.exists(thumbnail_path) and os.path.getsize(thumbnail_path) > 0:
-                                            self.video_info.thumbnail = thumbnail_path
-                                            logger.info(f"🖼️ Thumbnail downloaded: {thumbnail_path}")
-                                except Exception as e:
-                                    logger.warning(f"Cannot download thumbnail: {e}")
-                    
-                    if os.path.exists(temp_path):
-                        logger.info("🔐 Starting decryption process")
-                        
-                        try:
-                            # Read and decrypt the file
-                            with open(temp_path, 'rb') as encrypted_file:
-                                encrypted_data = encrypted_file.read()
-                                
-                                # Only decrypt first 28 bytes
-                                header_data = list(encrypted_data[:28])
-                                decrypted_header = self.decrypt_vid_data(header_data, self.decryption_key)
-                                
-                                # Write decrypted data
-                                with open(output_path, 'wb') as decrypted_file:
-                                    decrypted_file.write(bytes(decrypted_header))  # Write decrypted header
-                                    decrypted_file.write(encrypted_data[28:])    # Write rest of the file as is
+                            # If info_dict has resolution, update video_info
+                            self.video_info.width = info.get("width", 0)
+                            self.video_info.height = info.get("height", 0)
+                            self.video_info.duration = info.get("duration", 0)
+                            self.video_info.title = info.get("title", "")
                             
-                            # Remove temp file
-                            if os.path.exists(temp_path):
-                                os.remove(temp_path)
-                                
-                            logger.info(f"✅ Decryption completed: {output_path}")
+                            # Check if thumbnail info exists
+                            if "thumbnail" in info and info["thumbnail"]:
+                                self.video_info.thumbnail = info.get("thumbnail", "")
                             
-                            # Extract video metadata if not already available
-                            if self.video_info.width == 0 or self.video_info.height == 0:
-                                self.extract_video_metadata(output_path)
-                            
-                            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                                # Get proper media info for the file
-                                return True, output_path, self.video_info
-                            else:
-                                logger.error("❌ Decryption failed - file is empty or does not exist")
-                                return False, "Decryption failed - file is empty or does not exist", None
-                        except Exception as e:
-                            logger.error(f"❌ Decryption error: {str(e)}")
-                            # If decryption fails, try to return the undecrypted file
-                            if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
-                                os.rename(temp_path, output_path)
-                                # Extract video metadata
-                                self.extract_video_metadata(output_path)
-                                return True, output_path, self.video_info
-                            return False, f"Decryption error: {str(e)}", None
-                    else:
-                        logger.error("❌ Download failed - temp file does not exist")
-                        return False, "Download failed - temp file does not exist", None
-                        
+                            return True, filename
+                        return False, "Could not extract video info"
                 except Exception as e:
-                    logger.error(f"❌ Error processing encrypted video: {str(e)}")
-                    return False, f"Error processing encrypted video: {str(e)}", None
+                    logger.error(f"yt-dlp download error: {e}")
+                    logger.error(traceback.format_exc())
+                    return False, str(e)
             
-            # Normal download for non-encrypted files
-            else:
-                ydl_opts = {
-                    'format': 'best/bestvideo+bestaudio',
-                    'outtmpl': output_path,
-                    'progress_hooks': [self.progress_hook],
-                    'quiet': True,
-                    'noprogress': False,
-                    'no_warnings': True,
-                    'extract_flat': False,
-                    'nocheckcertificate': True,
-                    'ignoreerrors': True,
-                    'no_color': True,
-                    'prefer_insecure': True,
-                    'allow_unplayable_formats': True,
-                    'concurrent_fragments': 5,
-                    'buffersize': 32768,
-                    'http_chunk_size': 10485760,
-                    'retries': 10,
-                    'fragment_retries': 10,
-                    'file_access_retries': 10,
-                    'extractor_retries': 10,
-                    'socket_timeout': 30,
-                    'writeinfojson': True,  # Write info json for metadata
-                }
-
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    try:
-                        logger.info(f"🚀 Starting download: {self.filename}")
-                        info_dict = ydl.extract_info(self.url, download=True)
-                        
-                        # Extract video metadata from info_dict
-                        if info_dict:
-                            self.video_info.width = info_dict.get('width', 0)
-                            self.video_info.height = info_dict.get('height', 0)
-                            self.video_info.duration = info_dict.get('duration', 0) 
-                            self.video_info.title = info_dict.get('title', self.filename)
-                            self.video_info.format = info_dict.get('format', '')
-                            
-                            # Extract thumbnail if available
-                            thumbnail_url = info_dict.get('thumbnail')
-                            if thumbnail_url:
-                                thumbnail_path = f"{os.path.splitext(output_path)[0]}_thumb.jpg"
-                                try:
-                                    # Download thumbnail
-                                    r = requests.get(thumbnail_url, stream=True)
-                                    if r.status_code == 200:
-                                        with open(thumbnail_path, 'wb') as f:
-                                            r.raw.decode_content = True
-                                            shutil.copyfileobj(r.raw, f)
-                                        if os.path.exists(thumbnail_path) and os.path.getsize(thumbnail_path) > 0:
-                                            self.video_info.thumbnail = thumbnail_path
-                                            logger.info(f"🖼️ Thumbnail downloaded: {thumbnail_path}")
-                                except Exception as e:
-                                    logger.warning(f"Cannot download thumbnail: {e}")
-                        
-                        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                            logger.info(f"✅ Download completed: {output_path}")
-                            
-                            # Extract video metadata if not already available
-                            if self.video_info.width == 0 or self.video_info.height == 0:
-                                self.extract_video_metadata(output_path)
-                                
-                            return True, output_path, self.video_info
-                        else:
-                            logger.error("❌ Download failed - file is empty or does not exist")
-                            return False, "Download failed - file is empty or does not exist", None
-                    except Exception as e:
-                        logger.error(f"❌ Download error: {str(e)}")
-                        return False, str(e), None
-
+            # Run the download in a separate thread
+            result = await loop.run_in_executor(self.executor, run_download)
+            return result
+        
         except Exception as e:
-            logger.error(f"❌ General error: {str(e)}")
-            return False, str(e), None 
+            logger.error(f"Error setting up yt-dlp download: {e}")
+            logger.error(traceback.format_exc())
+            return False, str(e) 
